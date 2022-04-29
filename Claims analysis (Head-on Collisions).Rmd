@@ -1,0 +1,769 @@
+---
+title: "Head-on Collisions"
+author: "Matthew Pinkerton"
+date: "29/04/2022"
+output: 
+  prettydoc::html_pretty:
+    #theme: architect
+    highlight: github
+    toc: true
+    toc_depth: 4
+    number_sections: true
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r load-packages, include=FALSE, message = FALSE}
+#install.packages("psych")
+#install.packages("prettydoc")
+#install.packages("tidyverse")
+#install.packages("readxl")
+#install.packages("knitr")
+#install.packages("shiny")
+#install.packages("ggthemes")
+#install.packages("plotly")
+#install.packages("scales")
+#install.packages("xgboost")
+#install.packages("caret")
+#install.packages("data.table")
+#install.packages("mlr")
+#install.packages("GGally")
+library(psych)
+library(prettydoc)
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(shiny)
+library(ggthemes)
+library(plotly)
+library(scales)
+library(xgboost)
+library(caret)
+library(data.table)
+library(mlr)
+library(GGally)
+```
+
+
+# Project Outline
+
+## Background
+
+Insurance companies make pricing decisions based on historical claims experience. The more recent the claims experience, the more predictive it may be of future losses. In the case of many large claims however, the exact cost is not known at the time of the accident. In fact, some cases take years to develop and settle. Companies sometimes learn that a claim is large several years after the accident took place.
+
+Your Underwriting Director believes it is possible to predict the ultimate value of individual claims well in advance by using FNOL (First Notification Of Loss) characteristics. This is the information recorded when the claim is first notified. If so, it would allow the company to know about future costs earlier and this information could be used to make better pricing decisions.
+
+You are given a historical dataset of a particular type of claim - head-on collisions - and are also told their individual current estimated values (labelled Incurred). (Given these claims are now a few years old, you can assume the incurred values are equal to the cost at which the claims will finally settle).
+
+## Task Breakdown:
+
+1. Using this data, build a model to predict the ultimate individual claim amounts
+
+2. Your report should cover the following aspects:
+  + Issues identified with the data and how these were addressed
+  + Data cleansing
+  + Model specification and justification for selecting this model specification
+  + Assessment of your model's accuracy and model diagnostics
+  + Suggestions of how your model could be improved
+  + Practical challenges for implementing your model
+
+
+# Issues identified with the data and how these were addressed
+
+## Data Overview
+
+```{r load data}
+my_data <- read_excel("Head-on Collisions Data.xlsx", sheet = "Data")
+```
+
+The data is loaded into R.  
+It is helpful to understand the dimensions of the data, as shown in the table below.
+
+```{r data dimensions}
+
+data.frame(Number_of_Claims = dim(my_data)[1],
+           Variables = dim(my_data)[2]) %>% 
+  kable()
+
+```
+
+And below is a summary of the structure of the data.  
+
+From initial inspection of the data in the table below, we will update the "Claim Number" variable to "Claim_Number" and Capped incurred" variable to "Capped_incurred" as space separated headers can be inconvenient when processing.  
+We will also update the variables of values 0,1.. to factor data type so we can consider them as having levels.  
+Date_of_loss isn't useful for our model as it is, we are interested in knowing how long has elapsed since the loss to current date. We will use a current date of 01/01/2022 to train the model. We will create a new delta variable and remove "date_of_loss" from the data. For use in our model, we will then normalize this variable on a scale between 0 and 1 and call it "time_since_loss".
+
+```{r data structure}
+
+na <- sapply(my_data, function(x) sum(str_count(x, 'Not Applicable'))) + sapply(my_data, function(x) sum(str_count(x, 'N/A')))
+
+nk <- sapply(my_data, function(x) sum(str_count(x, 'n/k'))) + sapply(my_data, function(x) sum(str_count(x, 'N/K')))
+
+data.frame(Variable = names(my_data),
+           Data_Type = sapply(my_data, typeof),
+           First_Values = sapply(my_data, function(x) paste0(head(x),  collapse = ", ")),
+           "NA_values" = sapply(na, sum),
+           "NK_values" = sapply(nk, sum),
+           row.names = NULL) %>% 
+  kable()
+
+```
+
+```{r initial data cleaning}
+
+cols_to_upd <- c(14:44)
+my_data[,cols_to_upd] <- lapply(my_data[,cols_to_upd] , factor)
+
+my_data <- my_data %>%
+  rename("Claim_Number"="Claim Number") %>%
+  rename("Capped_Incurred"="Capped Incurred") %>%
+  mutate(days_since_loss = as.Date("2022-01-01")-as.Date(date_of_loss)) %>%
+  mutate(time_since_loss = as.double((days_since_loss - min(days_since_loss))/
+           as.double((max(days_since_loss)-min(days_since_loss))))) %>%
+  select(-c(date_of_loss, days_since_loss))
+
+```
+
+
+## Univariate EDA
+
+### Univariate EDA app
+
+The below application can be used to explore the data profile of each individual variable.  
+
+```{r EDA Part 1}
+
+shinyApp(
+  ui <- fluidPage(
+    
+    # Sidebar with a slider input for number of bins 
+    sidebarLayout(
+      sidebarPanel(
+        
+        selectInput("selected_var",
+                    "Variable:",
+                    choices = names(my_data),
+                    selected = "Capped_Incurred")
+        
+      ),
+      
+      # Show plot and numerical summary
+      mainPanel(
+        plotlyOutput("EDA_plot")
+      )
+    )
+  ),
+  
+  # Define server logic required to draw plot
+  server <- function(input, output) {
+      
+    output$EDA_plot <- renderPlotly({
+    
+      if (input$selected_var %in% c("Claim_Number", "Notification_period", "Inception_to_loss", "Time_hour", "Incurred", "Capped_Incurred", "days_since_loss")) {
+        
+        g <- ggplot(my_data, aes(y = !!sym(input$selected_var), fill = "")) +
+          geom_boxplot() +
+          ggtitle(paste0("Box Plot of ", input$selected_var)) +
+          scale_fill_manual(values = c(rgb(78,121,167,max=255))) +
+          theme_bw() +
+          labs(x = input$selected_var, y = "Count") +
+          theme(axis.text.x=element_blank(),
+                panel.grid.major.x = element_blank())
+        
+        ggplotly(g) %>%
+          hide_legend()
+      
+      } else {
+        
+        my_data_EDA1 <- my_data %>%
+          select(!!sym(input$selected_var))
+        
+        my_data_EDA1 <- as_tibble(table(my_data_EDA1)) %>%
+          rename("Count"="n") %>%
+          mutate(per=Count/sum(Count)) %>%
+          arrange(Count)
+        
+        names(my_data_EDA1)[names(my_data_EDA1) == 'my_data_EDA1'] <- input$selected_var
+          
+        
+        g <- ggplot(my_data_EDA1, aes(x = "", 
+                            y = Count, 
+                            fill = !!sym(input$selected_var), 
+                            text = paste(input$selected_var, ":", 
+                                         !!sym(input$selected_var), 
+                                         "\nCount:", Count, "\nPercent:", 
+                                         label_percent()(per)))) +
+          geom_bar(stat="identity") +
+          ggtitle(paste0("Bar Chart of ", input$selected_var)) +
+          xlab(paste(input$selected_var)) +
+          theme_bw() +
+          theme(panel.grid.major.x = element_blank()) +
+          scale_fill_tableau()
+        
+        ggplotly(g, tooltip=c("text"))
+      
+      }
+    
+    })
+
+  },
+  
+)
+```
+
+
+### The target variable?
+
+As we intend to predict the claim amount, we will look at a histogram of the "Incurred" variable shown below, with a numerical summary to better understand the distribution of the variable. We can see that the distribution is significantly right skewed, with most claims being smaller, but with rare claims being extremely larger than other claims.  
+The extreme values are outliers and would lead to less accurate machine learning models. We could make the decision to remove these claims from the data. But instead, we can make use of the convenient "Capped_Incurred" variable in the data. Here, the extremely high claim amounts have been eliminated by capping at £50,000, making them more representative in the data distribution.  
+There are also some negative claim amounts, which are possibly where claims are cancelled or rejected, payments are made from third parties, or possibly a favorable court decision for the insurer. Similarly, these negative values would lead to less accurate machine learning predictions. So we can also set a lower bound by capping claim amounts at £0.
+
+```{r incurred histogram}
+
+g <- ggplot(data = my_data, aes(x = Incurred, fill = "", text = paste("Count: ", ..count..))) +
+  geom_histogram(bins=50, color="black") +
+  scale_fill_manual(values = c(rgb(78,121,167,max=255))) +
+  labs(title="Histogram plot of Incurred") +
+  theme_light()
+
+ggplotly(g, tooltip=c("text")) %>%
+  hide_legend()
+
+incurred <- my_data %>%
+  summarise(count=n(),
+            mean=mean(Incurred),
+            median=median(Incurred),
+            min=min(Incurred),
+            max=max(Incurred),
+            range=max-min,
+            sd=sd(Incurred),
+            skew=skew(Incurred),
+            kurtosis=kurtosi(Incurred))
+
+colnames(incurred) = c('Count','Mean','Median','Min','Max','Range','Std Dev','Skew','Kurtosis')
+
+kable(incurred)
+  
+```
+
+
+## Dealing with N/A values
+
+We can check the number of NA values in the data. There are some NAs for weather conditions. Weather conditions could have been considered not applicable for collisions that happen for example in a tunnel, or under cover such as a bridge. For the purposes of our modelling, we will consider these values the same as 'NORMAL' i.e. reflecting no impact from extreme weather conditions.  
+
+There are also a small number of NAs for the location of incident. These cases could have occurred in irregular locations, or may fit the description of more than one location, it is unclear. We will reconsider them in the numerical encoding section.  
+
+## Dealing with N/K values
+
+We can also check the number of not known values in the data. For the not knowns of Location_of_incident, weather_conditions and Vehicle_mobile, it is likely related to uncertainty in data collection, where the variable was unclear in the specific case, or the required information was not gathered. For these variables, we will take the decision to remove them from the data to avoid the possibility that they would spoil the model. 
+
+There are a significant proportion of not knowns in the policy holders considering third party at fault variable. This information is not always available at the time particularly due to legal implications, and may never be disclosed in settlement scenarios. Given the significant proportion of this group, we will maintain this grouping in the data.
+
+## Numerical encoding
+
+Much of the data has already been one hot encoded or ordinally encoded. We will encode the remaining categorical data so that all of the data can be treated as numerical.
+
++ Notifier: We will encode "PH", "NamedDriver" (policy holder or named on policy) and "CNF" (on behalf of policy holder) with the value of 1. We will encode "TP" and "Other" with the value of 0.  
++ Location_of_incident: We will encode the areas of infrastructure and traffic ("Main Road", "Minor Road", "Motorway") with the value of 1. We will encode "Car Park", "Home Address", "Not Applicable", "Other" with the value of 0.  
++ Weather_conditions: Here we can consider the data as being in three levels of extremity. We will encode "SNOW,ICE,FOG" with a value of 2. We will encode "WET" with a value of 1. We will encode "NORMAL", "N/A" with a value of 0.  
++ Vehicle_mobile: With the removal of the "n/k" claims, we can simply encode "N" with the value of 0, and "Y" with the value of 1.  
++ Main_driver: The value of "Other" is not clear, but as they have not been recorded as being the main driver, we will make the assumption that they are not the main driver. We will therefore encode "Y" with a value of 1, and we will encode "N" and "Other" with a value of 0.  
++ PH_considered_TP_at_fault: As previously mentioned, we will include the not knowns here as a valid category to consider. We will encode "N" with a value of "0" and "Y" with a value of 1 maintaining a linear order. We will then assign "n/k" a value of 2.  
+
+## Other Data Considerations
+
+There are three cases where the notification period is negative. This doesn't seem to make sense logically and is likely a data entry error. We will remove these from the data.
+
+Similar to the "Incurred" variable, we can see that "Notification_period" also has extreme outliers. We will handle this in a similar way by capping it at 100 days to reduce the negative impact of outliers on training machine learning models. 
+
+There is one case where the value for policy holder considering third party at fault is "#". This is clearly not correct, and we will remove this claim from the data.
+
+There are a few variables where all data belong to a single category, this doesn't tell us any additional information and has no predictive power. We will remove the following variables from the data: Loss_code, Loss_description, TP_type_insd_pass_front, TP_type_pass_multi.
+
+There are a few variables where almost all data belong to a single category, this is insufficient to explain the variance, and they will also not be representative in both train and test data sets. So we will drop these variables as well from the data: TP_type_pedestrian, Vechile_registration_present, TP_type_cyclist.
+
+For some variables, particularly some of the variables of type 0,1,2.., it is unclear exactly what the values mean without a codebook.
+
+# Data Cleansing
+
+```{r data cleansing}
+
+clean_data <- my_data %>%
+  mutate(Capped_Incurred = pmax(Capped_Incurred, 0)) %>%
+  filter(Location_of_incident != "n/k") %>%
+  filter(Weather_conditions != "N/K") %>%
+  filter(Vehicle_mobile != "n/k") %>%
+  mutate(Notifier=recode(Notifier,'PH'='1','NamedDriver'='1','CNF'='1',
+                         'TP'='0','Other'='0')) %>%
+  mutate(Location_of_incident=recode(Location_of_incident,'Main Road'='1','Minor Road'='1','Motorway'='1',
+                                     'Home Address'='0','Car Park'='0','Not Applicable'='0','Other'='0')) %>%
+  mutate(Weather_conditions=recode(Weather_conditions,'SNOW,ICE,FOG'='2',
+                                   'WET'='1',
+                                   'NORMAL'='0','N/A'='0')) %>%
+  mutate(Vehicle_mobile=recode(Vehicle_mobile,'Y'='1',
+                               'N'='0')) %>%
+  mutate(Main_driver=recode(Main_driver,'Y'='1',
+                            'N'='0','Other'='0')) %>%
+  mutate(PH_considered_TP_at_fault=recode(PH_considered_TP_at_fault,'n/k'='2',
+                                   'Y'='1',
+                                   'N'='0')) %>%
+  filter(Notification_period >= 0) %>%
+  mutate(Capped_Notification_period = pmin(Notification_period, 100)) %>%
+  select(-Notification_period) %>%
+  filter(PH_considered_TP_at_fault != "#") %>%
+  select(-c(Incurred, Loss_code, Loss_description, TP_type_insd_pass_front, TP_type_pass_multi)) %>%
+  select(-c(TP_type_pedestrian, Vechile_registration_present, TP_type_cyclist))
+
+cols_to_upd <- c(2,4:6,8:9)
+clean_data[,cols_to_upd] <- lapply(clean_data[,cols_to_upd] , factor)
+
+```
+
+
+## Cleaned Data
+
+After cleaning the data as discussed above, the new data dimensions are shown in the table below.
+
+```{r new data dimensions}
+
+data.frame(Number_of_Claims = dim(clean_data)[1],
+           Variables = dim(clean_data)[2]) %>% 
+  kable()
+
+```
+
+
+## Bivariate EDA
+
+### Bivariate EDA app
+
+We will now analyse the cleaned data to see any association between variables with the below application. We will not take any steps at this stage to handle colinearity between explanatory variables. TP_Injury_whipash appears to have postive correlation with the capped_incurred variable. It is likely that multiple explanatory variables will be required to explain as much of the uncertainty in the target variable as possible.
+
+
+```{r EDA Part 2}
+
+shinyApp(
+  ui <- fluidPage(
+    
+    # Sidebar with a slider input for number of bins 
+    sidebarLayout(
+      sidebarPanel(
+        
+        selectInput("X_var",
+                    "x Variable:",
+                    choices = names(clean_data),
+                    selected = "days_since_loss"),
+        
+        selectInput("Y_var",
+                    "y Variable:",
+                    choices = names(clean_data),
+                    selected = "Capped_Incurred"),
+        
+      ),
+      
+      # Show plot and numerical summary
+      mainPanel(
+        plotlyOutput("EDA2_plot"),
+      )
+    )
+  ),
+  
+  # Define server logic required to draw plot
+  server <- function(input, output) {
+      
+    output$EDA2_plot <- renderPlotly({
+
+      g <-ggplot(clean_data, aes(x = !!sym(input$X_var), 
+                                  y = !!sym(input$Y_var), 
+                                  fill = "red", 
+                                  text = paste(input$X_var, ":", 
+                                              !!sym(input$X_var),
+                                              "\n",
+                                              input$Y_var, ":", 
+                                              !!sym(input$Y_var)))) +
+        geom_jitter() +
+        ggtitle(paste0("Linear regression of ", input$X_var, " & ", input$Y_var)) +
+        theme_light() +
+        scale_fill_manual(values=alpha(c(rgb(214,39,40,max=255)),0.5),name="")
+        
+      ggplotly(g, tooltip=c("text")) %>%
+        hide_legend()
+    
+    })
+
+  },
+  
+)
+```
+
+
+# Model specification and justification for selecting this model specification
+
+## Modelling assumptions
+
+We will assume that the data provided is a random sample of iid head-on collisions, and therefore any statistical results can be generalized to the entire population of head-on collisions it was collected from, and therefore this model would perform well with new data input.
+
+It is important to remember that this is an observational analysis, and therefore results can suggest correlation, but cannot infer causality. Only a controlled experiment with random assignment could infer causality i.e. setting up an experiment group and a control group, hypothesis testing a controlled change in conditions for causality.
+
+The goal is to predict the ultimate value of individual claims well in advance by using FNOL (First Notification Of Loss) characteristics. Our target dependent variable will be "Capped_Incurred". The remaining set of variables will be candidate explanatory variables for the predictive model, with the exception of Claim_Number which is just an identifier, and time_since_loss which will already be used in the model as the weight for a decay function.
+
+We are also told that the more recent the claims experience, the more predictive it may be of future losses. We can capture this effect by using the "days_since_loss" variable to apply a decay function to our model.
+
+## Choosing a model
+
+As the "Capped_Incurred" variable is continuous, we will need a regression algorithm to predict it. Linear regression would be a simpler option, but in our analysis we have not found strong linear relationships so a more complex function is likely required to achieve strong prediction. We will take the decision to use an XG Boost algorithm. It is a strong performing algorithm using gradient boosted decision trees that can be applied for regression. We have a sufficiently large dataset, and a good ratio of observations to variables. Also, XG Boost will perform well with our data that has a mixture of numerical and categorical/factored variables.
+
+## Train-test data split
+
+The first thing we'll need to do is randomly split our data into training and testing sets. The training set should be the largest for training the model, we will use 75% of the data which is ~5,250 claims. We will use 25% of the data (~1,750 claims) as a testing set, acting as an independent test of how well the model performs when exposed to data it hasn't seen before.
+
+We will make the decision not to segment a validation set for tuning hyperparameters; instead we will use cross-validation and random search of the training data for hyperparameter tuning.
+
+```{r train-valid-test split}
+
+#fix random number for repeatability
+set.seed(100)
+#create random number column
+clean_data <- clean_data %>%
+  mutate(randnum = runif(nrow(clean_data)))
+
+#train data
+train_data <- clean_data %>%
+  filter(randnum < 0.75) %>%
+  select(-randnum)
+
+#test data
+test_data <- clean_data %>%
+  filter(randnum >= 0.75) %>%
+  select(-randnum)
+
+```
+
+## Initial Model
+
+We will first use our data to build an initial model with default hyper parameters. We will tune the parameters after to see if we can improve the model. We can use cross validation at this stage to determine the optimal number of rounds/tree splits before the model stops improving. It varies slightly with each run due to randomness in the model approach, but for this model the optimal trees is found to be ~5. The associated MAE is also found to be ~ 3,200 for the train set each run, and ~ 4,500 for the test set each run. The large difference between the train and test error suggests that the model is overfit to the training data, the gamma parameter might need tweaked.
+
+```{r initial model, include=FALSE}
+
+#Designate variables as target variable, identifying key variable, possible explanatory/predictor variables
+target_var <- "Capped_Incurred"
+key_var <- "Claim_Number"
+decay_var <- "time_since_loss"
+predictors <- names(train_data)[!(names(train_data) %in% target_var | 
+                                  names(train_data) %in% key_var |
+                                  names(train_data) %in% decay_var)]
+
+#create model matrix
+train_matrix <- xgb.DMatrix(data = data.matrix(train_data[,c(predictors),with=F]),
+                            label = data.matrix(train_data$Capped_Incurred),
+                            weight = data.matrix(train_data$time_since_loss))
+
+test_matrix <- xgb.DMatrix(data = data.matrix(test_data[,c(predictors),with=F]),
+                           label = data.matrix(test_data$Capped_Incurred),
+                           weight = data.matrix(test_data$time_since_loss))
+
+#default parameters
+parameters <- list(objective = "reg:squarederror",
+                   booster = "gbtree", #gblinear?
+                   eval_metric = "mae",
+                   eta = 0.3,
+                   max_depth = 6,
+                   subsample =  1,
+                   colsample_bytree = 1,
+                   min_child_weight = 1,
+                   gamma = 0)
+
+#find the best nround parameter for this model
+gbm_cv <- xgb.cv(data = train_matrix,
+                 params = parameters, 
+                 nrounds = 100, 
+                 nfold = 5, 
+                 showsd = T, 
+                 stratified = T, 
+                 early.stop.round = 20, 
+                 maximize = F,
+                 verbose = TRUE)
+
+#optimal number of decision tree splits
+optimal_trees <- gbm_cv$evaluation_log[test_mae_mean == min(test_mae_mean),iter]
+
+#MAE
+train_mae <- gbm_cv$evaluation_log[,min(train_mae_mean)]
+test_mae <- gbm_cv$evaluation_log[,min(test_mae_mean)]
+
+#fit model
+gbm <- xgb.train(data = train_matrix,
+                 params = parameters,
+                 nrounds = optimal_trees,
+                 verbose = TRUE)
+
+```
+
+
+### Initial Model: Performance
+
+```{r initial model performance}
+
+#predictions vs. actual
+train_results <- data.table(Claim_Number = train_data$Claim_Number,
+                            Actual = train_data$Capped_Incurred,
+                            Model_Prediction = predict(gbm, train_matrix))
+
+test_results <- data.table(Claim_Number = test_data$Claim_Number,
+                            Actual = test_data$Capped_Incurred,
+                            Model_Prediction = predict(gbm, test_matrix))
+
+df <- data.frame(optimal_trees = c(optimal_trees),
+                 train_mae = c(train_mae),
+                 test_mae = c(test_mae))
+
+df %>%
+  kable()
+
+```
+
+
+### Initial Model: Feature Importance
+
+Below is a bar chart of the top 20 most important features in the model that has been trained. We can see that the degree of whiplash is the strongest indicator of the incurred claim amount, explaining ~ 0.5% of the uncertainty. The degree of trauma is also a notable indicator, explaining ~ 0.16% of the uncertainty. Other variables contribute small gain to the model.
+
+```{r initial model features}
+#feature importance
+feature_importance <- xgb.importance(predictors, gbm)
+
+setorder(x = feature_importance,
+         order = -Gain)
+
+g <- ggplot(feature_importance[1:20], aes(x = Gain, y = reorder(Feature, Gain), fill = "",
+                          text = paste(Feature, 
+                                       "\nGain:", Gain, 
+                                       "\nCover", Cover, 
+                                       "\nFrequency", Frequency))) +
+  geom_bar(stat = "identity") +
+  ggtitle(paste0("Initial Model: Bar Chart of Feature Importance")) +
+  theme_bw() +
+  labs(y = "Feature") +
+  xlim(0, 0.6) +
+  scale_fill_tableau()
+        
+ggplotly(g, tooltip=c("text")) %>%
+  hide_legend()
+
+```
+
+
+```{r Random Search tuning, include=FALSE}
+
+#create tasks
+traintask <- makeRegrTask(data = train_data, target = "Capped_Incurred")
+testtask <- makeRegrTask(data = test_data, target = "Capped_Incurred")
+
+#one hot encoding 
+traintask <- createDummyFeatures(obj = traintask) 
+testtask <- createDummyFeatures(obj = testtask)
+
+#create learner
+my_learner <- makeLearner("regr.xgboost",predict.type = "response")
+my_learner$par.vals <- list( objective="reg:squarederror", eval_metric="mae", nrounds=15, eta=0.3)
+
+#set parameter space
+model_Params <- makeParamSet(
+  makeIntegerParam("nrounds",lower=5,upper=25),
+  makeIntegerParam("max_depth",lower=1,upper=11),
+  makeIntegerParam("gamma",lower=0,upper=10),
+  makeNumericParam("eta", lower = 0.01, upper = 0.5),
+  makeNumericParam("subsample", lower = 0.5, upper = 1.0),
+  makeNumericParam("min_child_weight",lower=1,upper=5),
+  makeNumericParam("colsample_bytree",lower = 0.5,upper = 1.0)
+)
+
+#set resampling strategy
+cv_folds <- makeResampleDesc("CV",iters=10)
+
+#search strategy
+ctrl <- makeTuneControlRandom(maxit = 5)
+
+#parameter tuning
+my_tuning <- tuneParams(learner = my_learner, task = traintask, resampling = cv_folds, measures = mae,
+                     par.set = model_Params, control = ctrl, show.info = T)
+
+```
+
+## Final tuned model
+
+Using random search for the best hyperparameters, we have found the below optimal hyperparameters.
+
+### Optimal hyperparameters
+
+```{r tuned parameters}
+
+kable(as.data.frame(my_tuning$x))
+
+```
+
+
+```{r tuned model, include=FALSE}
+
+#tuned parameters
+parameters <- list(objective = "reg:squarederror",
+                   booster = "gbtree",
+                   eval_metric = "mae",
+                   eta = my_tuning$x[4],
+                   max_depth = my_tuning$x[2],
+                   subsample =  my_tuning$x[5],
+                   colsample_bytree = my_tuning$x[7],
+                   min_child_weight = my_tuning$x[6],
+                   gamma = my_tuning$x[3])
+
+#verify cv
+gbm_cv <- xgb.cv(data = train_matrix,
+                 params = parameters, 
+                 nrounds = as.numeric(my_tuning$x[1]), 
+                 nfold = 5, 
+                 showsd = T, 
+                 stratified = T, 
+                 early_stopping_rounds = 20, 
+                 maximize = F,
+                 verbose = TRUE)
+
+#optimal number of decision tree splits
+optimal_trees <- gbm_cv$evaluation_log[test_mae_mean == min(test_mae_mean),iter]
+
+#MAE
+train_mae <- gbm_cv$evaluation_log[,min(train_mae_mean)]
+test_mae <- gbm_cv$evaluation_log[,min(test_mae_mean)]
+
+#fit model
+gbm <- xgb.train(data = train_matrix,
+                 params = parameters,
+                 nrounds = optimal_trees,
+                 verbose = TRUE)
+
+```
+
+### Tuned Model: Performance
+
+Passing these parameters into our model, we find the following results. We can see that the model performs slightly better with lower mae for the test data of ~ 4,400. But this is at expense to the performance on the train data which now has a higher mae of ~ 3,900. This suggests that the previous parameters led to the model being overfitted to the training data and we have now reduced this effect by optimising over the test data.  
+
+```{r tuned model performance}
+
+#predictions vs. actual
+train_results <- data.table(Claim_Number = train_data$Claim_Number,
+                            Actual = train_data$Capped_Incurred,
+                            Model_Prediction = predict(gbm, train_matrix))
+
+test_results <- data.table(Claim_Number = test_data$Claim_Number,
+                            Actual = test_data$Capped_Incurred,
+                            Model_Prediction = predict(gbm, test_matrix))
+
+df <- data.frame(optimal_trees = c(optimal_trees),
+                 train_mae = c(train_mae),
+                 test_mae = c(test_mae))
+
+df %>%
+  kable()
+
+```
+
+### Tuned Model: Feature Importance
+
+The same bar chart has been produced for the tuned model, of the top 20 most important features in the model that has been trained. We can see that the degree of whiplash and degree of trauma are still the strongest indicators of the incurred claim amount, but the importance of other variables has increased so that more variables are now contributing significantly to the model.
+
+```{r tuned model features}
+#feature importance
+feature_importance <- xgb.importance(predictors, gbm)
+
+setorder(x = feature_importance,
+         order = -Gain)
+
+g <- ggplot(feature_importance[1:20], aes(x = Gain, y = reorder(Feature, Gain), fill = "",
+                          text = paste(Feature, 
+                                       "\nGain:", Gain, 
+                                       "\nCover", Cover, 
+                                       "\nFrequency", Frequency))) +
+  geom_bar(stat = "identity") +
+  ggtitle(paste0("Initial Model: Bar Chart of Feature Importance")) +
+  theme_bw() +
+  labs(y = "Feature") +
+  xlim(0, 0.6) +
+  scale_fill_tableau()
+        
+ggplotly(g, tooltip=c("text")) %>%
+  hide_legend()
+
+```
+
+# Assessment of your model’s accuracy and model diagnostics
+
+The evaluating statistic we have used is the MAE, which we have found to be between ~ 4,400 for each run of the model on our test data. With the data ranging over 0 to 50,000, this is a fairly strong prediction.
+
+We used a gradient boosting tree algortihm rather than a gradient boosting linear algorithm. With gbtree the model can fit to the training data better without linear restrictions, but is more likely to overfit the data. It will predict well for data similar in values to the data it was trained on, but will predict poorly for extreme datapoints as it can not extrapolate. A linear model can extrapolate and therefore would perform better on datapoints outside of the original training set values. This is important to us as we capped the target variable, our model would poorly predict the true values above or below the caps. 
+
+## Residual plot
+
+We can examine the residual differences between the actual claim amounts and the predicted amounts. We can see that the residuals have fairly consistent variability across all claims, and are approximately centered around zero. It appears that many claim amounts are slightly underestimated, with extreme overestimations being more common than extreme underestimations. There does not seem to be any trend indicating dependencies with individual claims.
+
+
+```{r residuals diagnostics}
+
+test_results <- test_results %>%
+  mutate(residual = Actual - Model_Prediction)
+
+g <- ggplot(test_results, aes(x = Claim_Number, 
+                              y = residual,
+                              color = "",
+                              text = paste("Claim Number:", Claim_Number, "\nResidual", residual))) +
+  geom_jitter() +
+  ggtitle(paste0("Residual plot of actual claim amounts vs. prediction")) +
+  theme_light() +
+  scale_color_manual(values=alpha(c(rgb(214,39,40,max=255)),0.5),name="")
+        
+ggplotly(g, tooltip=c("text")) %>%
+  hide_legend()
+
+```
+
+## Covariance plot
+
+Now that we know the most important features to the model, we can check the covariances between these variables. Below, we compare the top five explanatory variables together with the target variable. Some of the plots are not helpful for investigation due to the types of data. Linear relationships are more obvious here between the target variable and the explanatory variable in the box plots in the first row of plots. There is not any obvious correlation between other variables.
+
+```{r covariance diagnostics, message = FALSE}
+
+covariance_data <- clean_data %>%
+  select(Capped_Incurred, TP_injury_whiplash, TP_injury_traumatic, TP_type_nk, TP_type_other, TP_injury_unclear)
+
+ggpairs(covariance_data)
+
+```
+
+
+# Suggestions of how your model could be improved
+
+The model could be improved with exposure to more data, either in the form of more claim observations, or more variables where new information could provide strong explanation for the claims amount. 
+
+We only considered one approach of XG Boost modelling. Many other algorithms could be considered, a single other algorithm may yield stronger results, or an ensemble of multiple models may produce the most accurate results, through averaging or stacking of models.
+
+Hyperparameters were optimised across a specified range. It is possible that the optimal parameters were outside of this range, so exploring more permutations of hyperparameters could lead to a better model. We used cross validation and random searching, a validation data set is another option to find the best hyperparameters. 
+
+We made some assumptions during the feature engineering stage in how missing values were handled and categorical data was numerically encoded. It is possible that there were other methods that would have lead to features that produce a better model.
+
+As part of feature selection, principal component analysis could have been used to create new and uncorrelated variables as input for the model.  
+
+Probability distribution theory could have been utilized, modelling claim arrivals as poisson distributions and waiting times by exponential distribution to discover further relationships.  
+
+The model depends on many variables, a parsimonious model would be easier for implementation and interpretation.  
+
+
+# Practical challenges for implementing your model
+
+We will not always have access to all the datapoints required depending on data collection.  
+
+A simpler algorithm like linear regression is easier to understand the results than our model using gradient boosted decision trees.
+
+Some of the features do not seem as relevant, but are required to rerun the model with new data.
+
+With so many features contributing to a prediction of a claim amount, if this is used as a basis for insurance pricing, we must be sure that the decision process is ethical and does not unfairly discriminate.  
+
